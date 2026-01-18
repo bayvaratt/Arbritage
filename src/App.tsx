@@ -28,7 +28,7 @@ const OKX_WS_URL = "wss://ws.okx.com:8443/ws/v5/public";
 // - Binance WS streams continuously.
 // - OKX mark price via WS (push).
 // - Funding + 24h volumes via REST (slow).
-const UI_REFRESH_MS = 5000;
+const UI_REFRESH_MS = 1000;
 const BINANCE_24H_POLL_MS = 60_000;
 const OKX_FUNDING_POLL_MS = 60_000;
 const OKX_24H_POLL_MS = 60_000;
