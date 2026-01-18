@@ -22,13 +22,16 @@ import { useEffect, useMemo, useRef, useState } from "react";
 const BINANCE_WS_URL = "wss://fstream.binance.com/ws/!markPrice@arr@1s";
 const BINANCE_REST_BASE = "https://fapi.binance.com";
 const OKX_REST_BASE = "https://www.okx.com";
+const OKX_WS_URL = "wss://ws.okx.com:8443/ws/v5/public";
 
-// Update cadence. Binance WS streams continuously; UI refresh + REST polling are 5s.
+// Update cadence.
+// - Binance WS streams continuously.
+// - OKX mark price via WS (push).
+// - Funding + 24h volumes via REST (slow).
 const UI_REFRESH_MS = 5000;
-const BINANCE_24H_POLL_MS = 5000;
-const OKX_MARK_POLL_MS = 5000;
-const OKX_FUNDING_POLL_MS = 5000;
-const OKX_24H_POLL_MS = 5000;
+const BINANCE_24H_POLL_MS = 60_000;
+const OKX_FUNDING_POLL_MS = 60_000;
+const OKX_24H_POLL_MS = 60_000;
 
 type SortKey =
   | "bnPrice"
@@ -504,50 +507,158 @@ export default function BinanceFuturesFundingDashboard() {
   }, []);
 
   // -------------------------
-  // OKX REST polling: mark, funding, 24h volume
+  // OKX WebSocket (mark price) — faster + avoids REST CORS.
+  // We fetch the SWAP instruments list once, then subscribe in batches.
   // -------------------------
   useEffect(() => {
-    let alive = true;
+    let ws: WebSocket | null = null;
+    let closedByUser = false;
+    let pingTimer: number | null = null;
+    let reconnectTimer: number | null = null;
 
-    async function fetchOkxMark() {
+    async function fetchOkxUsdtSwapInstIds(): Promise<string[]> {
+      const url = `${OKX_REST_BASE}/api/v5/public/instruments?instType=SWAP`;
+      const res = await fetch(url, { method: "GET" });
+      const json = await res.json();
+      if (!res.ok || json?.code !== "0" || !Array.isArray(json?.data)) return [];
+
+      const instIds: string[] = [];
+      for (const x of json.data) {
+        const instId = String(x?.instId ?? "").toUpperCase();
+        // Only subscribe to USDT-margined swaps so volumes are comparable in USDT.
+        if (instId.endsWith("-USDT-SWAP")) instIds.push(instId);
+      }
+      return instIds;
+    }
+
+    async function connect() {
       try {
-        const url = `${OKX_REST_BASE}/api/v5/public/mark-price?instType=SWAP`;
-        const res = await fetch(url, { method: "GET" });
-        const json = await res.json();
+        const instIds = await fetchOkxUsdtSwapInstIds();
+        if (closedByUser) return;
 
-        if (!alive) return;
-
-        if (!res.ok || json?.code !== "0" || !Array.isArray(json?.data)) {
+        if (instIds.length === 0) {
           setOkxMarkOk(false);
+          // retry later
+          if (!closedByUser) reconnectTimer = window.setTimeout(connect, 2000);
           return;
         }
 
-        const m = rowsRef.current;
-        for (const x of json.data) {
-          const instId = x?.instId;
-          const markPx = x?.markPx;
-          const ticker = normalizeOkxInstId(instId);
-          if (!ticker || markPx === undefined) continue;
-          if (!isUsdtTicker(ticker)) continue;
+        ws = new WebSocket(OKX_WS_URL);
 
-          const row = getOrInitRow(m, ticker);
-          row.okxPrice = Number(markPx);
+        ws.onopen = () => {
+          setOkxMarkOk(true);
 
-          // If we have base volume already, convert immediately.
-          const vUsdt = convertOkxBaseVolToUsdt(row.okxBaseVol24h, row.okxPrice);
-          if (vUsdt !== null) row.okxVol24h = vUsdt;
-        }
+          // Keepalive: OKX accepts "ping" and replies "pong".
+          pingTimer = window.setInterval(() => {
+            try {
+              ws?.send("ping");
+            } catch {
+              // ignore
+            }
+          }, 20_000);
 
-        okxMarkLastMsRef.current = Date.now();
-        setOkxMarkOk(true);
-        dirtyRef.current = true;
+          // Subscribe in batches to respect WS request limits.
+          // Conservative batching: 50 instruments per request, 350ms between requests.
+          const BATCH = 50;
+          let reqId = 1;
+
+          const sendBatch = (start: number) => {
+            if (closedByUser) return;
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+            const slice = instIds.slice(start, start + BATCH);
+            if (slice.length === 0) return;
+
+            const msg = {
+              id: String(reqId++),
+              op: "subscribe",
+              args: slice.map((instId) => ({ channel: "mark-price", instId })),
+            };
+
+            try {
+              ws.send(JSON.stringify(msg));
+            } catch {
+              // ignore
+            }
+
+            if (start + BATCH < instIds.length) {
+              window.setTimeout(() => sendBatch(start + BATCH), 350);
+            }
+          };
+
+          sendBatch(0);
+        };
+
+        ws.onclose = () => {
+          setOkxMarkOk(false);
+          if (pingTimer !== null) window.clearInterval(pingTimer);
+          pingTimer = null;
+
+          if (!closedByUser) reconnectTimer = window.setTimeout(connect, 1000);
+        };
+
+        ws.onmessage = (evt) => {
+          // Keepalive response
+          if (evt.data === "pong") return;
+
+          try {
+            const msg = JSON.parse(evt.data as string);
+
+            // subscription acks look like { event: 'subscribe', arg: {...} }
+            if (msg?.event) return;
+
+            const arg = msg?.arg;
+            if (arg?.channel !== "mark-price") return;
+
+            const data = msg?.data;
+            if (!Array.isArray(data) || data.length === 0) return;
+
+            const instId = String(arg?.instId ?? data[0]?.instId ?? "");
+            const markPx = data[0]?.markPx;
+            if (!instId || markPx === undefined) return;
+
+            const ticker = normalizeOkxInstId(instId);
+            if (!ticker || !isUsdtTicker(ticker)) return;
+
+            const row = getOrInitRow(rowsRef.current, ticker);
+            row.okxPrice = Number(markPx);
+
+            // If we have base volume already, convert immediately.
+            const vUsdt = convertOkxBaseVolToUsdt(row.okxBaseVol24h, row.okxPrice);
+            if (vUsdt !== null) row.okxVol24h = vUsdt;
+
+            okxMarkLastMsRef.current = Date.now();
+            dirtyRef.current = true;
+          } catch (error) {
+            // eslint-disable-next-line no-console
+            console.error("Error handling OKX WS message:", error);
+          }
+        };
       } catch (error) {
-        if (!alive) return;
         setOkxMarkOk(false);
-        // eslint-disable-next-line no-console
-        console.error("Error fetching OKX mark price:", error);
+        if (!closedByUser) reconnectTimer = window.setTimeout(connect, 2000);
       }
     }
+
+    connect();
+
+    return () => {
+      closedByUser = true;
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      if (pingTimer !== null) window.clearInterval(pingTimer);
+      try {
+        ws?.close();
+      } catch {
+        // ignore
+      }
+    };
+  }, []);
+
+  // -------------------------
+  // OKX REST polling: funding + 24h volume (slow)
+  // -------------------------
+  useEffect(() => {
+    let alive = true;
 
     async function fetchOkxFunding() {
       try {
@@ -655,17 +766,14 @@ export default function BinanceFuturesFundingDashboard() {
       }
     }
 
-    fetchOkxMark();
     fetchOkxFunding();
     fetchOkx24h();
 
-    const tMark = window.setInterval(fetchOkxMark, OKX_MARK_POLL_MS);
     const tFunding = window.setInterval(fetchOkxFunding, OKX_FUNDING_POLL_MS);
     const t24h = window.setInterval(fetchOkx24h, OKX_24H_POLL_MS);
 
     return () => {
       alive = false;
-      window.clearInterval(tMark);
       window.clearInterval(tFunding);
       window.clearInterval(t24h);
     };
