@@ -32,6 +32,7 @@ const UI_REFRESH_MS = 1000;
 const BINANCE_24H_POLL_MS = 60_000;
 const OKX_FUNDING_POLL_MS = 60_000;
 const OKX_24H_POLL_MS = 60_000;
+const MIN_VOL_USDT = 10_000_000;
 
 type SortKey =
   | "bnPrice"
@@ -271,6 +272,7 @@ export default function BinanceFuturesFundingDashboard() {
   // UI
   const [search, setSearch] = useState("");
   const [sort, setSort] = useState<SortState>({ key: "priceDiff", dir: "desc" });
+  const [hideLowVol, setHideLowVol] = useState(false);
 
   // Data store
   const rowsRef = useRef<Map<string, Row>>(new Map());
@@ -894,7 +896,13 @@ export default function BinanceFuturesFundingDashboard() {
     );
 
     const q = search.trim().toUpperCase();
-    const filtered = q ? all.filter((x) => x.ticker.includes(q)) : all;
+    let filtered = q ? all.filter((x) => x.ticker.includes(q)) : all;
+
+    if (hideLowVol) {
+      filtered = filtered.filter(
+        (x) => (x.bnVol24h ?? 0) >= MIN_VOL_USDT && (x.okxVol24h ?? 0) >= MIN_VOL_USDT
+      );
+    }
 
     const dirMul = sort.dir === "asc" ? 1 : -1;
 
@@ -915,7 +923,7 @@ export default function BinanceFuturesFundingDashboard() {
       priceDiff: priceDiffAbsFrac(r),
       fundingDiff: fundingDiffAbs(r),
     }));
-  }, [rowsVersion, search, sort.key, sort.dir]);
+  }, [rowsVersion, search, hideLowVol, sort.key, sort.dir]);
 
   function toggleSort(key: SortKey) {
     setSort((s) => {
@@ -1020,6 +1028,16 @@ export default function BinanceFuturesFundingDashboard() {
               USDT-only is <span className="font-semibold">enabled</span> (locked). OKX 24h volume is converted to USDT via{" "}
               <span className="font-mono">volCcy24h * markPrice</span>.
             </div>
+
+            <label className="mt-1 inline-flex items-center gap-2 text-xs text-slate-300">
+              <input
+                type="checkbox"
+                checked={hideLowVol}
+                onChange={(e) => setHideLowVol(e.target.checked)}
+                className="h-4 w-4 rounded border-slate-700 bg-slate-900 text-emerald-400 focus:ring-emerald-400/30"
+              />
+              Hide low volume (&lt; {Math.round(MIN_VOL_USDT / 1_000_000)}M on either exchange)
+            </label>
 
             <div className="text-xs text-slate-400">All columns except ticker are sortable. UI refresh: 5s.</div>
           </div>
