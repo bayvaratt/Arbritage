@@ -579,16 +579,13 @@ export default function BinanceFuturesFundingDashboard() {
         const state = String(x?.state ?? "").toLowerCase();
         if (state && state !== "live") continue;
         const instId = String(x?.instId ?? "").toUpperCase();
-        const base = String(x?.baseCcy ?? "").toUpperCase();
-        const quote = String(x?.quoteCcy ?? "").toUpperCase();
         // Only subscribe to USDT-margined swaps so volumes are comparable in USDT.
-        if (instId.endsWith("-USDT-SWAP") && quote === "USDT" && base) {
-          const ticker = `${base}${quote}`;
-          if (!isUsdtTicker(ticker)) continue;
-          instIds.push(instId);
-          tickerSet.add(ticker);
-          instToTicker.set(instId, ticker);
-        }
+        if (!instId.endsWith("-USDT-SWAP")) continue;
+        const ticker = normalizeOkxInstId(instId);
+        if (!ticker || !isUsdtTicker(ticker)) continue;
+        instIds.push(instId);
+        tickerSet.add(ticker);
+        instToTicker.set(instId, ticker);
       }
       okxUsdtSwapTickersRef.current = tickerSet;
       okxInstIdToTickerRef.current = instToTicker;
