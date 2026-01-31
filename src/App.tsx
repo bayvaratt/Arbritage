@@ -77,8 +77,10 @@ type DerivedRow = Row & {
   fundingDiff: number | null; // abs rate
 };
 
+const USDT_TICKER_RE = /^[A-Z0-9]+USDT$/;
+
 function isUsdtTicker(ticker: string): boolean {
-  return ticker.toUpperCase().endsWith("USDT");
+  return USDT_TICKER_RE.test(String(ticker).toUpperCase());
 }
 
 function fmtNum(n: number | null): string {
@@ -269,6 +271,10 @@ export default function BinanceFuturesFundingDashboard() {
   const rowsRef = useRef<Map<string, Row>>(new Map());
   // Binance funding interval overrides (only returned for symbols with adjusted interval).
   const bnFundingIntervalOverridesRef = useRef<Map<string, number>>(new Map());
+  // Active symbol sets (best-effort). If empty, we fall back to the original behavior.
+  const bnUsdtPerpTickersRef = useRef<Set<string>>(new Set());
+  const okxUsdtSwapTickersRef = useRef<Set<string>>(new Set());
+  const okxInstIdToTickerRef = useRef<Map<string, string>>(new Map());
 
   // We collect updates continuously, but only re-render the table every UI_REFRESH_MS.
   const dirtyRef = useRef(false);
@@ -301,6 +307,46 @@ export default function BinanceFuturesFundingDashboard() {
         console.error(e);
       }
     }
+  }, []);
+
+  // -------------------------
+  // Binance REST: active USDT-margined perpetual symbols
+  // -------------------------
+  useEffect(() => {
+    let alive = true;
+
+    async function fetchBinanceSymbols() {
+      try {
+        const url = `${BINANCE_REST_BASE}/fapi/v1/exchangeInfo`;
+        const res = await fetch(url, { method: "GET" });
+        const json = await res.json();
+
+        if (!alive) return;
+        if (!res.ok || !Array.isArray(json?.symbols)) return;
+
+        const active = new Set<string>();
+        for (const x of json.symbols) {
+          if (x?.contractType !== "PERPETUAL") continue;
+          if (String(x?.quoteAsset ?? "").toUpperCase() !== "USDT") continue;
+          if (x?.status !== "TRADING") continue;
+          const ticker = String(x?.symbol ?? "").toUpperCase();
+          if (!isUsdtTicker(ticker)) continue;
+          active.add(ticker);
+        }
+
+        bnUsdtPerpTickersRef.current = active;
+      } catch {
+        // ignore; fall back to loose filtering
+      }
+    }
+
+    fetchBinanceSymbols();
+    const t = window.setInterval(fetchBinanceSymbols, 5 * 60_000);
+
+    return () => {
+      alive = false;
+      window.clearInterval(t);
+    };
   }, []);
 
   // UI refresh tick: update the table every 5 seconds.
@@ -354,6 +400,7 @@ export default function BinanceFuturesFundingDashboard() {
 
             const ticker = String(s).toUpperCase();
             if (!isUsdtTicker(ticker)) continue;
+            if (bnUsdtPerpTickersRef.current.size && !bnUsdtPerpTickersRef.current.has(ticker)) continue;
 
             const row = getOrInitRow(m, ticker);
             row.bnPrice = Number(p);
@@ -421,6 +468,7 @@ export default function BinanceFuturesFundingDashboard() {
 
           const ticker = String(symbol).toUpperCase();
           if (!isUsdtTicker(ticker)) continue;
+          if (bnUsdtPerpTickersRef.current.size && !bnUsdtPerpTickersRef.current.has(ticker)) continue;
 
           // quoteVolume is in quote asset (USDT here)
           const qv = x?.quoteVolume;
@@ -477,6 +525,7 @@ export default function BinanceFuturesFundingDashboard() {
           if (!sym || hrs === undefined) continue;
           const ticker = String(sym).toUpperCase();
           if (!isUsdtTicker(ticker)) continue;
+          if (bnUsdtPerpTickersRef.current.size && !bnUsdtPerpTickersRef.current.has(ticker)) continue;
           const h = Number(hrs);
           if (Number.isFinite(h) && h > 0 && h <= 24) overrides.set(ticker, h);
         }
@@ -487,6 +536,7 @@ export default function BinanceFuturesFundingDashboard() {
         const m = rowsRef.current;
         for (const [ticker, row] of m.entries()) {
           if (!isUsdtTicker(ticker)) continue;
+          if (bnUsdtPerpTickersRef.current.size && !bnUsdtPerpTickersRef.current.has(ticker)) continue;
           row.bnIntervalHours = overrides.get(ticker) ?? row.bnIntervalHours ?? 8;
         }
 
@@ -523,11 +573,25 @@ export default function BinanceFuturesFundingDashboard() {
       if (!res.ok || json?.code !== "0" || !Array.isArray(json?.data)) return [];
 
       const instIds: string[] = [];
+      const tickerSet = new Set<string>();
+      const instToTicker = new Map<string, string>();
       for (const x of json.data) {
+        const state = String(x?.state ?? "").toLowerCase();
+        if (state && state !== "live") continue;
         const instId = String(x?.instId ?? "").toUpperCase();
+        const base = String(x?.baseCcy ?? "").toUpperCase();
+        const quote = String(x?.quoteCcy ?? "").toUpperCase();
         // Only subscribe to USDT-margined swaps so volumes are comparable in USDT.
-        if (instId.endsWith("-USDT-SWAP")) instIds.push(instId);
+        if (instId.endsWith("-USDT-SWAP") && quote === "USDT" && base) {
+          const ticker = `${base}${quote}`;
+          if (!isUsdtTicker(ticker)) continue;
+          instIds.push(instId);
+          tickerSet.add(ticker);
+          instToTicker.set(instId, ticker);
+        }
       }
+      okxUsdtSwapTickersRef.current = tickerSet;
+      okxInstIdToTickerRef.current = instToTicker;
       return instIds;
     }
 
@@ -613,12 +677,14 @@ export default function BinanceFuturesFundingDashboard() {
             const data = msg?.data;
             if (!Array.isArray(data) || data.length === 0) return;
 
-            const instId = String(arg?.instId ?? data[0]?.instId ?? "");
+            const instId = String(arg?.instId ?? data[0]?.instId ?? "").toUpperCase();
             const markPx = data[0]?.markPx;
             if (!instId || markPx === undefined) return;
 
-            const ticker = normalizeOkxInstId(instId);
+            const mapped = okxInstIdToTickerRef.current.get(instId);
+            const ticker = mapped ?? normalizeOkxInstId(instId);
             if (!ticker || !isUsdtTicker(ticker)) return;
+            if (okxUsdtSwapTickersRef.current.size && !okxUsdtSwapTickersRef.current.has(ticker)) return;
 
             const row = getOrInitRow(rowsRef.current, ticker);
             row.okxPrice = Number(markPx);
@@ -675,14 +741,16 @@ export default function BinanceFuturesFundingDashboard() {
 
         const m = rowsRef.current;
         for (const x of json.data) {
-          const instId = x?.instId;
+          const instId = String(x?.instId ?? "").toUpperCase();
           const fr = x?.fundingRate;
           const nextFundingTime = x?.nextFundingTime;
           const fundingTime = x?.fundingTime;
 
-          const ticker = normalizeOkxInstId(instId);
+          const mapped = okxInstIdToTickerRef.current.get(instId);
+          const ticker = mapped ?? normalizeOkxInstId(instId);
           if (!ticker || fr === undefined) continue;
           if (!isUsdtTicker(ticker)) continue;
+          if (okxUsdtSwapTickersRef.current.size && !okxUsdtSwapTickersRef.current.has(ticker)) continue;
 
           const row = getOrInitRow(m, ticker);
           row.okxFunding = Number(fr);
@@ -729,10 +797,12 @@ export default function BinanceFuturesFundingDashboard() {
 
         const m = rowsRef.current;
         for (const x of json.data) {
-          const instId = x?.instId;
-          const ticker = normalizeOkxInstId(instId);
+          const instId = String(x?.instId ?? "").toUpperCase();
+          const mapped = okxInstIdToTickerRef.current.get(instId);
+          const ticker = mapped ?? normalizeOkxInstId(instId);
           if (!ticker) continue;
           if (!isUsdtTicker(ticker)) continue;
+          if (okxUsdtSwapTickersRef.current.size && !okxUsdtSwapTickersRef.current.has(ticker)) continue;
 
           const row = getOrInitRow(m, ticker);
 
