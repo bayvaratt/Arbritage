@@ -150,12 +150,17 @@ function fundingCell(rate: number | null, intervalHours: number | null) {
   );
 }
 
-function normalizeOkxInstId(instId: string | null | undefined): string | null {
-  // BTC-USDT-SWAP -> BTCUSDT
+function okxInstIdToCanonical(instId: string | null | undefined): string | null {
+  // BTC-USDT-SWAP -> BTCUSDT (ignore extra segments)
   if (!instId) return null;
   const upper = String(instId).toUpperCase();
-  const noSwap = upper.endsWith("-SWAP") ? upper.slice(0, -5) : upper;
-  return noSwap.replaceAll("-", "");
+  if (upper.includes("/") || upper.includes(":")) return null;
+  const parts = upper.split("-");
+  if (parts.length < 2) return null;
+  const base = parts[0];
+  const quote = parts[1];
+  if (!base || quote !== "USDT") return null;
+  return `${base}${quote}`;
 }
 
 function getOrInitRow(map: Map<string, Row>, ticker: string): Row {
@@ -221,8 +226,8 @@ function runSelfTests() {
     if (!cond) throw new Error(`Self-test failed: ${name}`);
   };
 
-  assert("normalizeOkxInstId BTC-USDT-SWAP", normalizeOkxInstId("BTC-USDT-SWAP") === "BTCUSDT");
-  assert("normalizeOkxInstId BTC-USDT", normalizeOkxInstId("BTC-USDT") === "BTCUSDT");
+  assert("okxInstIdToCanonical BTC-USDT-SWAP", okxInstIdToCanonical("BTC-USDT-SWAP") === "BTCUSDT");
+  assert("okxInstIdToCanonical BTC-USDT", okxInstIdToCanonical("BTC-USDT") === "BTCUSDT");
   assert("isUsdtTicker true", isUsdtTicker("BTCUSDT") === true);
   assert("isUsdtTicker false", isUsdtTicker("BTCUSD") === false);
 
@@ -275,6 +280,28 @@ export default function BinanceFuturesFundingDashboard() {
   const bnUsdtPerpTickersRef = useRef<Set<string>>(new Set());
   const okxUsdtSwapTickersRef = useRef<Set<string>>(new Set());
   const okxInstIdToTickerRef = useRef<Map<string, string>>(new Map());
+  const commonUsdtPerpsRef = useRef<Set<string>>(new Set());
+
+  function recomputeCommonUniverse() {
+    const bn = bnUsdtPerpTickersRef.current;
+    const okx = okxUsdtSwapTickersRef.current;
+    if (bn.size && okx.size) {
+      const common = new Set<string>();
+      for (const t of bn) {
+        if (okx.has(t)) common.add(t);
+      }
+      commonUsdtPerpsRef.current = common;
+
+      // Prune stale rows that are no longer in the common universe.
+      const m = rowsRef.current;
+      for (const [ticker] of m.entries()) {
+        if (!common.has(ticker)) m.delete(ticker);
+      }
+      dirtyRef.current = true;
+    } else {
+      commonUsdtPerpsRef.current = new Set<string>();
+    }
+  }
 
   // We collect updates continuously, but only re-render the table every UI_REFRESH_MS.
   const dirtyRef = useRef(false);
@@ -335,6 +362,7 @@ export default function BinanceFuturesFundingDashboard() {
         }
 
         bnUsdtPerpTickersRef.current = active;
+        recomputeCommonUniverse();
       } catch {
         // ignore; fall back to loose filtering
       }
@@ -401,6 +429,7 @@ export default function BinanceFuturesFundingDashboard() {
             const ticker = String(s).toUpperCase();
             if (!isUsdtTicker(ticker)) continue;
             if (bnUsdtPerpTickersRef.current.size && !bnUsdtPerpTickersRef.current.has(ticker)) continue;
+            if (commonUsdtPerpsRef.current.size && !commonUsdtPerpsRef.current.has(ticker)) continue;
 
             const row = getOrInitRow(m, ticker);
             row.bnPrice = Number(p);
@@ -469,6 +498,7 @@ export default function BinanceFuturesFundingDashboard() {
           const ticker = String(symbol).toUpperCase();
           if (!isUsdtTicker(ticker)) continue;
           if (bnUsdtPerpTickersRef.current.size && !bnUsdtPerpTickersRef.current.has(ticker)) continue;
+          if (commonUsdtPerpsRef.current.size && !commonUsdtPerpsRef.current.has(ticker)) continue;
 
           // quoteVolume is in quote asset (USDT here)
           const qv = x?.quoteVolume;
@@ -526,6 +556,7 @@ export default function BinanceFuturesFundingDashboard() {
           const ticker = String(sym).toUpperCase();
           if (!isUsdtTicker(ticker)) continue;
           if (bnUsdtPerpTickersRef.current.size && !bnUsdtPerpTickersRef.current.has(ticker)) continue;
+          if (commonUsdtPerpsRef.current.size && !commonUsdtPerpsRef.current.has(ticker)) continue;
           const h = Number(hrs);
           if (Number.isFinite(h) && h > 0 && h <= 24) overrides.set(ticker, h);
         }
@@ -537,6 +568,7 @@ export default function BinanceFuturesFundingDashboard() {
         for (const [ticker, row] of m.entries()) {
           if (!isUsdtTicker(ticker)) continue;
           if (bnUsdtPerpTickersRef.current.size && !bnUsdtPerpTickersRef.current.has(ticker)) continue;
+          if (commonUsdtPerpsRef.current.size && !commonUsdtPerpsRef.current.has(ticker)) continue;
           row.bnIntervalHours = overrides.get(ticker) ?? row.bnIntervalHours ?? 8;
         }
 
@@ -572,23 +604,24 @@ export default function BinanceFuturesFundingDashboard() {
       const json = await res.json();
       if (!res.ok || json?.code !== "0" || !Array.isArray(json?.data)) return [];
 
-      const instIds: string[] = [];
-      const tickerSet = new Set<string>();
-      const instToTicker = new Map<string, string>();
-      for (const x of json.data) {
-        const state = String(x?.state ?? "").toLowerCase();
-        if (state && state !== "live") continue;
-        const instId = String(x?.instId ?? "").toUpperCase();
-        // Only subscribe to USDT-margined swaps so volumes are comparable in USDT.
-        if (!instId.endsWith("-USDT-SWAP")) continue;
-        const ticker = normalizeOkxInstId(instId);
-        if (!ticker || !isUsdtTicker(ticker)) continue;
-        instIds.push(instId);
-        tickerSet.add(ticker);
-        instToTicker.set(instId, ticker);
-      }
+        const instIds: string[] = [];
+        const tickerSet = new Set<string>();
+        const instToTicker = new Map<string, string>();
+        for (const x of json.data) {
+          const state = String(x?.state ?? "").toLowerCase();
+          if (state && state !== "live") continue;
+          const instId = String(x?.instId ?? "").toUpperCase();
+          // Only subscribe to USDT-margined swaps so volumes are comparable in USDT.
+          if (!instId.endsWith("-USDT-SWAP")) continue;
+          const ticker = okxInstIdToCanonical(instId);
+          if (!ticker || !isUsdtTicker(ticker)) continue;
+          instIds.push(instId);
+          tickerSet.add(ticker);
+          instToTicker.set(instId, ticker);
+        }
       okxUsdtSwapTickersRef.current = tickerSet;
       okxInstIdToTickerRef.current = instToTicker;
+      recomputeCommonUniverse();
       return instIds;
     }
 
@@ -679,9 +712,11 @@ export default function BinanceFuturesFundingDashboard() {
             if (!instId || markPx === undefined) return;
 
             const mapped = okxInstIdToTickerRef.current.get(instId);
-            const ticker = mapped ?? normalizeOkxInstId(instId);
+            if (okxInstIdToTickerRef.current.size && !mapped) return;
+            const ticker = mapped ?? okxInstIdToCanonical(instId);
             if (!ticker || !isUsdtTicker(ticker)) return;
             if (okxUsdtSwapTickersRef.current.size && !okxUsdtSwapTickersRef.current.has(ticker)) return;
+            if (commonUsdtPerpsRef.current.size && !commonUsdtPerpsRef.current.has(ticker)) return;
 
             const row = getOrInitRow(rowsRef.current, ticker);
             row.okxPrice = Number(markPx);
@@ -744,10 +779,12 @@ export default function BinanceFuturesFundingDashboard() {
           const fundingTime = x?.fundingTime;
 
           const mapped = okxInstIdToTickerRef.current.get(instId);
-          const ticker = mapped ?? normalizeOkxInstId(instId);
+          if (okxInstIdToTickerRef.current.size && !mapped) continue;
+          const ticker = mapped ?? okxInstIdToCanonical(instId);
           if (!ticker || fr === undefined) continue;
           if (!isUsdtTicker(ticker)) continue;
           if (okxUsdtSwapTickersRef.current.size && !okxUsdtSwapTickersRef.current.has(ticker)) continue;
+          if (commonUsdtPerpsRef.current.size && !commonUsdtPerpsRef.current.has(ticker)) continue;
 
           const row = getOrInitRow(m, ticker);
           row.okxFunding = Number(fr);
@@ -796,10 +833,12 @@ export default function BinanceFuturesFundingDashboard() {
         for (const x of json.data) {
           const instId = String(x?.instId ?? "").toUpperCase();
           const mapped = okxInstIdToTickerRef.current.get(instId);
-          const ticker = mapped ?? normalizeOkxInstId(instId);
+          if (okxInstIdToTickerRef.current.size && !mapped) continue;
+          const ticker = mapped ?? okxInstIdToCanonical(instId);
           if (!ticker) continue;
           if (!isUsdtTicker(ticker)) continue;
           if (okxUsdtSwapTickersRef.current.size && !okxUsdtSwapTickersRef.current.has(ticker)) continue;
+          if (commonUsdtPerpsRef.current.size && !commonUsdtPerpsRef.current.has(ticker)) continue;
 
           const row = getOrInitRow(m, ticker);
 
@@ -849,7 +888,10 @@ export default function BinanceFuturesFundingDashboard() {
   const rows: DerivedRow[] = useMemo(() => {
     void rowsVersion;
 
-    const all = Array.from(rowsRef.current.values()).filter((x) => isUsdtTicker(x.ticker));
+    const common = commonUsdtPerpsRef.current;
+    const all = Array.from(rowsRef.current.values()).filter(
+      (x) => isUsdtTicker(x.ticker) && (!common.size || common.has(x.ticker))
+    );
 
     const q = search.trim().toUpperCase();
     const filtered = q ? all.filter((x) => x.ticker.includes(q)) : all;
