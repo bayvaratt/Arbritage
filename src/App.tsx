@@ -33,6 +33,10 @@ const BINANCE_24H_POLL_MS = 60_000;
 const OKX_FUNDING_POLL_MS = 60_000;
 const OKX_24H_POLL_MS = 60_000;
 const MIN_VOL_USDT = 10_000_000;
+const DIFF_CANDLE_INTERVAL = "5m";
+const DIFF_LOOKBACK_MS = 48 * 60 * 60_000;
+const DIFF_REFRESH_MS = 30 * 60_000;
+const DIFF_MAX_POINTS = 576;
 
 type SortKey =
   | "bnPrice"
@@ -76,6 +80,13 @@ type Row = {
 type DerivedRow = Row & {
   priceDiff: number | null; // abs fraction
   fundingDiff: number | null; // abs rate
+};
+
+type DiffPoint = {
+  t: number;
+  diffPct: number;
+  bn: number;
+  okx: number;
 };
 
 const USDT_TICKER_RE = /^[A-Z0-9]+USDT$/;
@@ -126,6 +137,13 @@ function fmtPctAbsFromFraction(frac: number | null): string {
   return fmtPctAbs(frac);
 }
 
+function fmtSignedPct(n: number | null, digits = 4): string {
+  if (n === null || n === undefined || Number.isNaN(n)) return "—";
+  const sign = n > 0 ? "+" : n < 0 ? "-" : "";
+  const abs = Math.abs(n);
+  return `${sign}${abs.toFixed(digits)}%`;
+}
+
 function classNames(...xs: Array<string | false | null | undefined>): string {
   return xs.filter(Boolean).join(" ");
 }
@@ -162,6 +180,71 @@ function okxInstIdToCanonical(instId: string | null | undefined): string | null 
   const quote = parts[1];
   if (!base || quote !== "USDT") return null;
   return `${base}${quote}`;
+}
+
+async function fetchBinanceMarkCandles(symbol: string, startMs: number): Promise<Array<[number, number]>> {
+  const params = new URLSearchParams({
+    symbol,
+    interval: DIFF_CANDLE_INTERVAL,
+    limit: String(DIFF_MAX_POINTS),
+  });
+  const url = `${BINANCE_REST_BASE}/fapi/v1/markPriceKlines?${params.toString()}`;
+  const res = await fetch(url, { method: "GET" });
+  const json = await res.json();
+  if (!res.ok || !Array.isArray(json)) return [];
+
+  const out: Array<[number, number]> = [];
+  for (const row of json) {
+    const t = Number(row?.[0]);
+    const close = Number(row?.[4]);
+    if (!Number.isFinite(t) || !Number.isFinite(close)) continue;
+    if (t < startMs) continue;
+    out.push([t, close]);
+  }
+  return out.sort((a, b) => a[0] - b[0]);
+}
+
+async function fetchOkxMarkCandles(instId: string, startMs: number): Promise<Array<[number, number]>> {
+  const out: Array<[number, number]> = [];
+  let after: number | null = null;
+  let loops = 0;
+
+  while (out.length < DIFF_MAX_POINTS && loops < 10) {
+    const params = new URLSearchParams({
+      instId,
+      bar: DIFF_CANDLE_INTERVAL,
+      limit: "100",
+    });
+    if (after !== null) params.set("after", String(after));
+
+    const url = `${OKX_REST_BASE}/api/v5/market/mark-price-candles?${params.toString()}`;
+    const res = await fetch(url, { method: "GET" });
+    const json = await res.json();
+    if (!res.ok || json?.code !== "0" || !Array.isArray(json?.data)) break;
+
+    const data = json.data;
+    if (!data.length) break;
+
+    let minTs = Number.POSITIVE_INFINITY;
+    for (const row of data) {
+      const t = Number(row?.[0]);
+      const close = Number(row?.[4]);
+      if (!Number.isFinite(t) || !Number.isFinite(close)) continue;
+      minTs = Math.min(minTs, t);
+      if (t < startMs) continue;
+      out.push([t, close]);
+    }
+
+    if (!Number.isFinite(minTs) || minTs <= startMs) break;
+    after = minTs - 1;
+    loops += 1;
+  }
+
+  const map = new Map<number, number>();
+  for (const [t, c] of out) {
+    if (!map.has(t)) map.set(t, c);
+  }
+  return Array.from(map.entries()).sort((a, b) => a[0] - b[0]);
 }
 
 function getOrInitRow(map: Map<string, Row>, ticker: string): Row {
@@ -273,6 +356,11 @@ export default function BinanceFuturesFundingDashboard() {
   const [search, setSearch] = useState("");
   const [sort, setSort] = useState<SortState>({ key: "priceDiff", dir: "desc" });
   const [hideLowVol, setHideLowVol] = useState(false);
+  const [diffTicker, setDiffTicker] = useState<string | null>(null);
+  const [diffSeries, setDiffSeries] = useState<DiffPoint[] | null>(null);
+  const [diffLoading, setDiffLoading] = useState(false);
+  const [diffError, setDiffError] = useState<string | null>(null);
+  const [diffUpdatedMs, setDiffUpdatedMs] = useState<number | null>(null);
 
   // Data store
   const rowsRef = useRef<Map<string, Row>>(new Map());
@@ -282,7 +370,9 @@ export default function BinanceFuturesFundingDashboard() {
   const bnUsdtPerpTickersRef = useRef<Set<string>>(new Set());
   const okxUsdtSwapTickersRef = useRef<Set<string>>(new Set());
   const okxInstIdToTickerRef = useRef<Map<string, string>>(new Map());
+  const okxTickerToInstIdRef = useRef<Map<string, string>>(new Map());
   const commonUsdtPerpsRef = useRef<Set<string>>(new Set());
+  const diffCacheRef = useRef<Map<string, { points: DiffPoint[]; updatedMs: number }>>(new Map());
 
   function recomputeCommonUniverse() {
     const bn = bnUsdtPerpTickersRef.current;
@@ -609,6 +699,7 @@ export default function BinanceFuturesFundingDashboard() {
         const instIds: string[] = [];
         const tickerSet = new Set<string>();
         const instToTicker = new Map<string, string>();
+        const tickerToInst = new Map<string, string>();
         for (const x of json.data) {
           const state = String(x?.state ?? "").toLowerCase();
           if (state && state !== "live") continue;
@@ -620,9 +711,11 @@ export default function BinanceFuturesFundingDashboard() {
           instIds.push(instId);
           tickerSet.add(ticker);
           instToTicker.set(instId, ticker);
+          tickerToInst.set(ticker, instId);
         }
       okxUsdtSwapTickersRef.current = tickerSet;
       okxInstIdToTickerRef.current = instToTicker;
+      okxTickerToInstIdRef.current = tickerToInst;
       recomputeCommonUniverse();
       return instIds;
     }
@@ -887,6 +980,72 @@ export default function BinanceFuturesFundingDashboard() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!diffTicker) return;
+    let alive = true;
+    let timer: number | null = null;
+
+    const fetchSeries = async (): Promise<DiffPoint[]> => {
+      const instId = okxTickerToInstIdRef.current.get(diffTicker);
+      if (!instId) throw new Error("Missing OKX instrument mapping.");
+
+      const startMs = Date.now() - DIFF_LOOKBACK_MS;
+      const [bn, okx] = await Promise.all([
+        fetchBinanceMarkCandles(diffTicker, startMs),
+        fetchOkxMarkCandles(instId, startMs),
+      ]);
+
+      const okxMap = new Map<number, number>(okx);
+      const points: DiffPoint[] = [];
+      for (const [t, bnPx] of bn) {
+        const okxPx = okxMap.get(t);
+        if (!Number.isFinite(bnPx) || !Number.isFinite(okxPx)) continue;
+        if (bnPx === 0) continue;
+        const diffPct = ((okxPx - bnPx) / bnPx) * 100;
+        points.push({ t, diffPct, bn: bnPx, okx: okxPx });
+      }
+      return points;
+    };
+
+    const load = async (force = false) => {
+      const cached = diffCacheRef.current.get(diffTicker);
+      const now = Date.now();
+      if (!force && cached && now - cached.updatedMs < DIFF_REFRESH_MS) {
+        setDiffSeries(cached.points);
+        setDiffUpdatedMs(cached.updatedMs);
+        setDiffError(null);
+        setDiffLoading(false);
+        return;
+      }
+
+      setDiffLoading(true);
+      setDiffError(null);
+      try {
+        const points = await fetchSeries();
+        if (!alive) return;
+        const updatedMs = Date.now();
+        diffCacheRef.current.set(diffTicker, { points, updatedMs });
+        setDiffSeries(points);
+        setDiffUpdatedMs(updatedMs);
+        setDiffLoading(false);
+      } catch (err) {
+        if (!alive) return;
+        setDiffError(err instanceof Error ? err.message : "Failed to fetch history.");
+        setDiffLoading(false);
+      }
+    };
+
+    void load(false);
+    timer = window.setInterval(() => {
+      void load(true);
+    }, DIFF_REFRESH_MS);
+
+    return () => {
+      alive = false;
+      if (timer !== null) window.clearInterval(timer);
+    };
+  }, [diffTicker]);
+
   const rows: DerivedRow[] = useMemo(() => {
     void rowsVersion;
 
@@ -936,6 +1095,65 @@ export default function BinanceFuturesFundingDashboard() {
     if (sort.key !== key) return "";
     return sort.dir === "asc" ? "▲" : "▼";
   }
+
+  function openDiffModal(ticker: string) {
+    setDiffTicker(ticker);
+    const cached = diffCacheRef.current.get(ticker);
+    if (cached) {
+      setDiffSeries(cached.points);
+      setDiffUpdatedMs(cached.updatedMs);
+      setDiffError(null);
+      setDiffLoading(false);
+    } else {
+      setDiffSeries(null);
+      setDiffUpdatedMs(null);
+      setDiffError(null);
+      setDiffLoading(true);
+    }
+  }
+
+  function closeDiffModal() {
+    setDiffTicker(null);
+    setDiffSeries(null);
+    setDiffUpdatedMs(null);
+    setDiffError(null);
+    setDiffLoading(false);
+  }
+
+  const diffChart = useMemo(() => {
+    if (!diffSeries || diffSeries.length === 0) return null;
+    const values = diffSeries.map((p) => p.diffPct);
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    let yMin = min;
+    let yMax = max;
+    if (yMin === yMax) {
+      yMin -= 0.5;
+      yMax += 0.5;
+    }
+
+    const n = diffSeries.length;
+    const pointsAttr = diffSeries
+      .map((p, i) => {
+        const x = n === 1 ? 50 : (i / (n - 1)) * 100;
+        const y = (1 - (p.diffPct - yMin) / (yMax - yMin)) * 100;
+        return `${x.toFixed(2)},${y.toFixed(2)}`;
+      })
+      .join(" ");
+
+    const zeroY = yMin < 0 && yMax > 0 ? (1 - (0 - yMin) / (yMax - yMin)) * 100 : null;
+    return {
+      pointsAttr,
+      yMin,
+      yMax,
+      zeroY,
+      start: diffSeries[0].t,
+      end: diffSeries[n - 1].t,
+      min,
+      max,
+      last: diffSeries[n - 1],
+    };
+  }, [diffSeries]);
 
   const anyRestError = !bn24hOk || !okxMarkOk || !okxFundingOk || !okx24hOk;
 
@@ -1130,7 +1348,17 @@ export default function BinanceFuturesFundingDashboard() {
 
                       <td className="px-4 py-2 tabular-nums text-slate-100">{fmtNum(r.bnPrice)}</td>
                       <td className="px-4 py-2 tabular-nums text-slate-100">{fmtNum(r.okxPrice)}</td>
-                      <td className="px-4 py-2 tabular-nums text-slate-200">{fmtPctAbsFromFraction(r.priceDiff)}</td>
+                      <td className="px-4 py-2 tabular-nums text-slate-200">
+                        <button
+                          type="button"
+                          onClick={() => openDiffModal(r.ticker)}
+                          className="inline-flex items-center gap-1 rounded-md px-1 py-0.5 text-slate-100 hover:bg-slate-800/60"
+                          title="Show 2d 5m price difference chart"
+                        >
+                          {fmtPctAbsFromFraction(r.priceDiff)}
+                          <span className="text-xs text-slate-400">chart</span>
+                        </button>
+                      </td>
 
                       <td className="px-4 py-2">{fundingCell(r.bnFunding, r.bnIntervalHours)}</td>
                       <td className="px-4 py-2">{fundingCell(r.okxFunding, r.okxIntervalHours)}</td>
@@ -1156,6 +1384,94 @@ export default function BinanceFuturesFundingDashboard() {
             </div>
           </div>
         </div>
+
+        {diffTicker && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-4" onClick={closeDiffModal}>
+            <div
+              className="w-full max-w-5xl rounded-2xl border border-slate-800 bg-slate-950/95 shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 px-4 py-3">
+                <div>
+                  <div className="text-xs uppercase tracking-wider text-slate-400">Price Difference (5m candles, 2d)</div>
+                  <div className="text-lg font-semibold text-slate-100">{diffTicker}</div>
+                </div>
+                <div className="flex items-center gap-3 text-xs text-slate-400">
+                  <span>Updated: {diffUpdatedMs ? new Date(diffUpdatedMs).toLocaleTimeString() : "—"}</span>
+                  <button
+                    type="button"
+                    onClick={closeDiffModal}
+                    className="rounded-md border border-slate-700 px-2 py-1 text-slate-200 hover:bg-slate-800"
+                  >
+                    Close
+                  </button>
+                </div>
+              </div>
+
+              <div className="px-4 py-4">
+                {diffLoading && (
+                  <div className="rounded-xl border border-slate-800 bg-slate-900/60 px-4 py-10 text-center text-sm text-slate-400">
+                    Loading 2-day history...
+                  </div>
+                )}
+
+                {!diffLoading && diffError && (
+                  <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">
+                    {diffError}
+                  </div>
+                )}
+
+                {!diffLoading && !diffError && diffChart && (
+                  <div className="flex flex-col gap-4">
+                    <div className="flex flex-wrap items-center gap-4 text-xs text-slate-300">
+                      <span>
+                        Range: {new Date(diffChart.start).toLocaleString()} to {new Date(diffChart.end).toLocaleString()}
+                      </span>
+                      <span>Last: {fmtSignedPct(diffChart.last.diffPct)}</span>
+                      <span>Min: {fmtSignedPct(diffChart.min)}</span>
+                      <span>Max: {fmtSignedPct(diffChart.max)}</span>
+                    </div>
+
+                    <div className="h-64 w-full rounded-xl border border-slate-800 bg-slate-900/60 p-2">
+                      <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="h-full w-full">
+                        <rect x="0" y="0" width="100" height="100" fill="transparent" />
+                        {[0, 25, 50, 75, 100].map((y) => (
+                          <line key={y} x1="0" y1={y} x2="100" y2={y} stroke="rgba(148,163,184,0.15)" strokeWidth="0.4" />
+                        ))}
+                        {diffChart.zeroY !== null ? (
+                          <line
+                            x1="0"
+                            y1={diffChart.zeroY}
+                            x2="100"
+                            y2={diffChart.zeroY}
+                            stroke="rgba(56,189,248,0.6)"
+                            strokeWidth="0.6"
+                          />
+                        ) : null}
+                        <polyline
+                          fill="none"
+                          stroke="rgba(34,197,94,0.9)"
+                          strokeWidth="0.8"
+                          points={diffChart.pointsAttr}
+                        />
+                      </svg>
+                    </div>
+
+                    <div className="text-xs text-slate-400">
+                      Signed diff % = (OKX − Binance) / Binance. History refreshes every 30 minutes.
+                    </div>
+                  </div>
+                )}
+
+                {!diffLoading && !diffError && !diffChart && (
+                  <div className="rounded-xl border border-slate-800 bg-slate-900/60 px-4 py-10 text-center text-sm text-slate-400">
+                    No history available for this ticker yet.
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
 
         {anyRestError && (
           <div className="mt-4 rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">
