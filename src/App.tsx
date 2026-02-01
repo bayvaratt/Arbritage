@@ -1000,6 +1000,7 @@ export default function BinanceFuturesFundingDashboard() {
       const points: DiffPoint[] = [];
       for (const [t, bnPx] of bn) {
         const okxPx = okxMap.get(t);
+        if (okxPx === undefined) continue;
         if (!Number.isFinite(bnPx) || !Number.isFinite(okxPx)) continue;
         if (bnPx === 0) continue;
         const diffPct = ((okxPx - bnPx) / bnPx) * 100;
