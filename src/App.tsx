@@ -361,6 +361,7 @@ export default function BinanceFuturesFundingDashboard() {
   const [diffLoading, setDiffLoading] = useState(false);
   const [diffError, setDiffError] = useState<string | null>(null);
   const [diffUpdatedMs, setDiffUpdatedMs] = useState<number | null>(null);
+  const [diffHoverIndex, setDiffHoverIndex] = useState<number | null>(null);
 
   // Data store
   const rowsRef = useRef<Map<string, Row>>(new Map());
@@ -1098,6 +1099,7 @@ export default function BinanceFuturesFundingDashboard() {
 
   function openDiffModal(ticker: string) {
     setDiffTicker(ticker);
+    setDiffHoverIndex(null);
     const cached = diffCacheRef.current.get(ticker);
     if (cached) {
       setDiffSeries(cached.points);
@@ -1118,6 +1120,7 @@ export default function BinanceFuturesFundingDashboard() {
     setDiffUpdatedMs(null);
     setDiffError(null);
     setDiffLoading(false);
+    setDiffHoverIndex(null);
   }
 
   const diffChart = useMemo(() => {
@@ -1133,15 +1136,24 @@ export default function BinanceFuturesFundingDashboard() {
     }
 
     const n = diffSeries.length;
-    const pointsAttr = diffSeries
-      .map((p, i) => {
-        const x = n === 1 ? 50 : (i / (n - 1)) * 100;
-        const y = (1 - (p.diffPct - yMin) / (yMax - yMin)) * 100;
-        return `${x.toFixed(2)},${y.toFixed(2)}`;
-      })
-      .join(" ");
+    const plot = { left: 8, right: 2, top: 6, bottom: 10 };
+    const width = 100 - plot.left - plot.right;
+    const height = 100 - plot.top - plot.bottom;
 
-    const zeroY = yMin < 0 && yMax > 0 ? (1 - (0 - yMin) / (yMax - yMin)) * 100 : null;
+    const mapped = diffSeries.map((p, i) => {
+      const x = n === 1 ? plot.left + width / 2 : plot.left + (i / (n - 1)) * width;
+      const y = plot.top + (1 - (p.diffPct - yMin) / (yMax - yMin)) * height;
+      return { ...p, x, y };
+    });
+
+    const pointsAttr = mapped.map((p) => `${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(" ");
+
+    const zeroY = yMin < 0 && yMax > 0 ? plot.top + (1 - (0 - yMin) / (yMax - yMin)) * height : null;
+    const ticks = [0, 0.25, 0.5, 0.75, 1].map((t) => {
+      const value = yMin + (yMax - yMin) * (1 - t);
+      const y = plot.top + height * t;
+      return { value, y };
+    });
     return {
       pointsAttr,
       yMin,
@@ -1152,6 +1164,11 @@ export default function BinanceFuturesFundingDashboard() {
       min,
       max,
       last: diffSeries[n - 1],
+      plot,
+      width,
+      height,
+      ticks,
+      mapped,
     };
   }, [diffSeries]);
 
@@ -1432,17 +1449,68 @@ export default function BinanceFuturesFundingDashboard() {
                       <span>Max: {fmtSignedPct(diffChart.max)}</span>
                     </div>
 
-                    <div className="h-64 w-full rounded-xl border border-slate-800 bg-slate-900/60 p-2">
-                      <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="h-full w-full">
+                    <div className="relative h-64 w-full rounded-xl border border-slate-800 bg-slate-900/60 p-2">
+                      <svg
+                        viewBox="0 0 100 100"
+                        preserveAspectRatio="none"
+                        className="h-full w-full cursor-crosshair"
+                        onMouseLeave={() => setDiffHoverIndex(null)}
+                        onMouseMove={(e) => {
+                          if (!diffChart) return;
+                          const rect = e.currentTarget.getBoundingClientRect();
+                          if (!rect.width) return;
+                          const pct = ((e.clientX - rect.left) / rect.width) * 100;
+                          const { plot, width, mapped } = diffChart;
+                          const clamped = Math.min(Math.max(pct - plot.left, 0), width);
+                          const idx = Math.round((clamped / width) * (mapped.length - 1));
+                          setDiffHoverIndex(Number.isFinite(idx) ? idx : null);
+                        }}
+                      >
                         <rect x="0" y="0" width="100" height="100" fill="transparent" />
-                        {[0, 25, 50, 75, 100].map((y) => (
-                          <line key={y} x1="0" y1={y} x2="100" y2={y} stroke="rgba(148,163,184,0.15)" strokeWidth="0.4" />
+                        {diffChart.ticks.map((t, i) => (
+                          <line
+                            key={`grid-${i}`}
+                            x1={diffChart.plot.left}
+                            y1={t.y}
+                            x2={100 - diffChart.plot.right}
+                            y2={t.y}
+                            stroke="rgba(148,163,184,0.15)"
+                            strokeWidth="0.4"
+                          />
+                        ))}
+                        <line
+                          x1={diffChart.plot.left}
+                          y1={diffChart.plot.top}
+                          x2={diffChart.plot.left}
+                          y2={100 - diffChart.plot.bottom}
+                          stroke="rgba(148,163,184,0.35)"
+                          strokeWidth="0.6"
+                        />
+                        <line
+                          x1={diffChart.plot.left}
+                          y1={100 - diffChart.plot.bottom}
+                          x2={100 - diffChart.plot.right}
+                          y2={100 - diffChart.plot.bottom}
+                          stroke="rgba(148,163,184,0.35)"
+                          strokeWidth="0.6"
+                        />
+                        {diffChart.ticks.map((t, i) => (
+                          <text
+                            key={`label-${i}`}
+                            x={diffChart.plot.left - 1}
+                            y={t.y + 1.6}
+                            textAnchor="end"
+                            fontSize="3"
+                            fill="rgba(148,163,184,0.75)"
+                          >
+                            {fmtSignedPct(t.value, 2)}
+                          </text>
                         ))}
                         {diffChart.zeroY !== null ? (
                           <line
-                            x1="0"
+                            x1={diffChart.plot.left}
                             y1={diffChart.zeroY}
-                            x2="100"
+                            x2={100 - diffChart.plot.right}
                             y2={diffChart.zeroY}
                             stroke="rgba(56,189,248,0.6)"
                             strokeWidth="0.6"
@@ -1454,7 +1522,50 @@ export default function BinanceFuturesFundingDashboard() {
                           strokeWidth="0.8"
                           points={diffChart.pointsAttr}
                         />
+                        {diffHoverIndex !== null && diffChart.mapped[diffHoverIndex] ? (
+                          <>
+                            <line
+                              x1={diffChart.mapped[diffHoverIndex].x}
+                              y1={diffChart.plot.top}
+                              x2={diffChart.mapped[diffHoverIndex].x}
+                              y2={100 - diffChart.plot.bottom}
+                              stroke="rgba(226,232,240,0.35)"
+                              strokeWidth="0.5"
+                            />
+                            <line
+                              x1={diffChart.plot.left}
+                              y1={diffChart.mapped[diffHoverIndex].y}
+                              x2={100 - diffChart.plot.right}
+                              y2={diffChart.mapped[diffHoverIndex].y}
+                              stroke="rgba(226,232,240,0.2)"
+                              strokeWidth="0.5"
+                            />
+                            <circle
+                              cx={diffChart.mapped[diffHoverIndex].x}
+                              cy={diffChart.mapped[diffHoverIndex].y}
+                              r="1.1"
+                              fill="rgba(248,250,252,0.9)"
+                              stroke="rgba(15,23,42,0.8)"
+                              strokeWidth="0.4"
+                            />
+                          </>
+                        ) : null}
                       </svg>
+                      {diffHoverIndex !== null && diffChart.mapped[diffHoverIndex] ? (
+                        <div
+                          className="pointer-events-none absolute rounded-md border border-slate-700 bg-slate-900/95 px-2 py-1 text-[11px] text-slate-100 shadow-lg"
+                          style={{
+                            left: `${diffChart.mapped[diffHoverIndex].x}%`,
+                            top: `${diffChart.mapped[diffHoverIndex].y}%`,
+                            transform: "translate(-50%, -120%)",
+                          }}
+                        >
+                          <div className="font-medium">{fmtSignedPct(diffChart.mapped[diffHoverIndex].diffPct, 4)}</div>
+                          <div className="text-[10px] text-slate-400">
+                            {new Date(diffChart.mapped[diffHoverIndex].t).toLocaleString()}
+                          </div>
+                        </div>
+                      ) : null}
                     </div>
 
                     <div className="text-xs text-slate-400">
